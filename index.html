@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#050816">
+  <title>Neon Hand Tracking</title>
+  <style>
+    :root { color-scheme: dark; --cyan:#55f7ff; --pink:#ff43d1; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; width:100%; min-height:100%; background:#050816; color:#effcff; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+    body { overflow:hidden; }
+    .app { min-height:100dvh; display:flex; flex-direction:column; background:radial-gradient(ellipse at 50% 0%, #102044 0%, #050816 55%); }
+    header { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:14px 16px 10px; z-index:2; }
+    .brand { font-weight:800; letter-spacing:.12em; font-size:13px; }
+    .brand span { color:var(--cyan); text-shadow:0 0 14px #55f7ff99; }
+    .status { font-size:11px; color:#a7c8d8; border:1px solid #24465a; border-radius:999px; padding:6px 9px; background:#071322cc; }
+    .stage { position:relative; flex:1; min-height:0; margin:0 10px; border:1px solid #1d4760; border-radius:18px; overflow:hidden; background:#02050c; box-shadow:0 0 35px #00d9ff12, inset 0 0 25px #00d9ff0a; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    video { transform:scaleX(-1); }
+    canvas { pointer-events:none; }
+    .placeholder { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:28px; text-align:center; color:#8caebb; line-height:1.5; background:radial-gradient(circle at center,#102039 0%,#030711 70%); }
+    .placeholder strong { display:block; color:#e9fdff; font-size:20px; margin-bottom:8px; }
+    .bottom { padding:13px 16px calc(16px + env(safe-area-inset-bottom)); display:grid; gap:10px; z-index:2; }
+    .controls { display:flex; gap:9px; }
+    button { appearance:none; border:0; border-radius:13px; padding:13px 16px; color:#031017; background:linear-gradient(110deg,#75fbff,#7aabff); font-weight:800; font-size:14px; flex:1; box-shadow:0 0 22px #2deaff20; }
+    button.secondary { color:#d6faff; background:#102235; border:1px solid #28506a; box-shadow:none; }
+    button:disabled { opacity:.55; }
+    .hint { font-size:12px; color:#9bb8c8; line-height:1.45; text-align:center; }
+    .meter { height:3px; background:#102338; border-radius:9px; overflow:hidden; }
+    .meter > div { height:100%; width:0; background:linear-gradient(90deg,var(--cyan),var(--pink)); box-shadow:0 0 12px var(--cyan); transition:width .15s; }
+    .error { color:#ffb7d5; }
+    @media (orientation:landscape) and (max-height:520px) {
+      header { padding:8px 12px 6px; }
+      .bottom { padding:8px 12px; grid-template-columns:1fr auto; align-items:center; }
+      .hint { text-align:left; }
+      button { padding:10px 13px; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">NEON <span>HAND LAB</span></div>
+    <div class="status" id="status">KAMERA BELUM AKTIF</div>
+  </header>
+  <main class="stage" id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="fx"></canvas>
+    <div class="placeholder" id="placeholder">
+      <div><strong>Gerakkan tanganmu.</strong>Garis neon akan mengikuti jari secara real-time.<br>Tekan “Mulai Kamera” untuk mulai.</div>
+    </div>
+  </main>
+  <section class="bottom">
+    <div class="meter"><div id="meterFill"></div></div>
+    <div class="controls">
+      <button id="startBtn">▶ Mulai Kamera</button>
+      <button id="stopBtn" class="secondary" disabled>■ Stop</button>
+    </div>
+    <div class="hint" id="hint">Izinkan akses kamera. Pencahayaan terang dan latar yang tidak terlalu ramai membantu pelacakan.</div>
+  </section>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('fx');
+  const ctx = canvas.getContext('2d');
+  const stage = document.getElementById('stage');
+  const placeholder = document.getElementById('placeholder');
+  const statusEl = document.getElementById('status');
+  const hint = document.getElementById('hint');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const meterFill = document.getElementById('meterFill');
+
+  let hands = null, stream = null, running = false, busy = false;
+  let lastLandmarks = null, rafId = 0, lastVideoTime = -1;
+  let trails = new Map();
+
+  // MediaPipe hand landmark connections (finger bones).
+  const connections = [
+    [0,1],[1,2],[2,3],[3,4],       // thumb
+    [0,5],[5,6],[6,7],[7,8],       // index
+    [5,9],[9,10],[10,11],[11,12],  // middle
+    [9,13],[13,14],[14,15],[15,16],// ring
+    [13,17],[17,18],[18,19],[19,20],[0,17] // pinky / palm
+  ];
+  const fingertips = [4,8,12,16,20];
+
+  function resizeCanvas() {
+    const rect = stage.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    canvas.height = Math.max(1, Math.round(rect.height * dpr));
+    canvas.style.width = rect.width + 'px';
+    canvas.style.height = rect.height + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resizeCanvas);
+  window.addEventListener('orientationchange', () => setTimeout(resizeCanvas, 250));
+  resizeCanvas();
+
+  function point(lm) {
+    // Camera preview is mirrored, so mirror landmark x to match what the user sees.
+    const rect = stage.getBoundingClientRect();
+    return { x: (1 - lm.x) * rect.width, y: lm.y * rect.height, z: lm.z || 0 };
+  }
+
+  function drawGlowLine(a, b, color, width) {
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 17;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.shadowBlur = 4;
+    ctx.strokeStyle = 'rgba(255,255,255,.92)';
+    ctx.lineWidth = Math.max(1, width * .28);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawHand(landmarks, handIndex) {
+    const pts = landmarks.map(point);
+    const hue = handIndex === 0 ? 184 : 310;
+    const main = `hsl(${hue} 100% 62%)`;
+    // Add a soft, animated pulse to each finger connection.
+    connections.forEach(([a,b], i) => {
+      const p = (Math.sin(performance.now() / 180 + i * .7) + 1) / 2;
+      drawGlowLine(pts[a], pts[b], main, 2.2 + p * 1.1);
+    });
+
+    // Bright joint nodes, with larger glowing fingertip rings.
+    pts.forEach((p, i) => {
+      const tip = fingertips.includes(i);
+      const radius = tip ? 5.5 : (i === 0 ? 4 : 2.5);
+      ctx.save();
+      ctx.beginPath(); ctx.arc(p.x, p.y, radius + (tip ? 2 * Math.sin(performance.now()/150) : 0), 0, Math.PI*2);
+      ctx.fillStyle = tip ? '#ffffff' : main;
+      ctx.shadowColor = main; ctx.shadowBlur = tip ? 24 : 10;
+      ctx.fill();
+      if (tip) {
+        ctx.beginPath(); ctx.arc(p.x, p.y, 11 + 2*Math.sin(performance.now()/130), 0, Math.PI*2);
+        ctx.strokeStyle = main; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.beginPath(); ctx.arc(p.x, p.y, 16, 0, Math.PI*2);
+        ctx.strokeStyle = `hsla(${hue},100%,70%,.35)`; ctx.lineWidth = 1; ctx.stroke();
+      }
+      ctx.restore();
+    });
+
+    // Draw a small sci-fi targeting circle on the palm center.
+    const palm = {
+      x: (pts[0].x + pts[5].x + pts[9].x + pts[13].x + pts[17].x) / 5,
+      y: (pts[0].y + pts[5].y + pts[9].y + pts[13].y + pts[17].y) / 5
+    };
+    ctx.save();
+    ctx.strokeStyle = `hsla(${hue},100%,70%,.65)`;
+    ctx.lineWidth = 1.2; ctx.shadowColor = main; ctx.shadowBlur = 12;
+    ctx.beginPath(); ctx.arc(palm.x, palm.y, 15, 0, Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(palm.x, palm.y, 21, -.7, .7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(palm.x, palm.y, 21, Math.PI-.7, Math.PI+.7); ctx.stroke();
+    ctx.restore();
+  }
+
+  function animate() {
+    if (!running) return;
+    const rect = stage.getBoundingClientRect();
+    ctx.clearRect(0, 0, rect.width, rect.height);
+    if (lastLandmarks && lastLandmarks.length) {
+      lastLandmarks.forEach((landmarks, i) => drawHand(landmarks, i));
+    }
+    rafId = requestAnimationFrame(animate);
+  }
+
+  async function initHands() {
+    if (hands) return;
+    if (typeof Hands === 'undefined') throw new Error('Library MediaPipe belum termuat. Periksa koneksi internet lalu muat ulang halaman.');
+    hands = new Hands({ locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.62,
+      minTrackingConfidence: 0.58
+    });
+    hands.onResults(results => {
+      lastLandmarks = results.multiHandLandmarks || [];
+      meterFill.style.width = lastLandmarks.length ? '100%' : '0%';
+      if (lastLandmarks.length) {
+        statusEl.textContent = `${lastLandmarks.length} TANGAN TERDETEKSI`;
+        hint.textContent = 'Mantap! Coba buka-tutup jari dan gerakkan tangan perlahan untuk melihat jejak neon.';
+      } else {
+        statusEl.textContent = 'MENCARI TANGAN…';
+      }
+      busy = false;
+    });
+  }
+
+  async function cameraLoop() {
+    if (!running) return;
+    if (!busy && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+      busy = true;
+      lastVideoTime = video.currentTime;
+      try { await hands.send({ image: video }); }
+      catch (e) { busy = false; console.warn(e); }
+    }
+    if (running) setTimeout(cameraLoop, 25);
+  }
+
+  async function start() {
+    startBtn.disabled = true;
+    statusEl.textContent = 'MENYIAPKAN…';
+    hint.textContent = 'Meminta izin kamera dan memuat model deteksi tangan…';
+    try {
+      await initHands();
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
+      video.srcObject = stream;
+      await video.play();
+      running = true;
+      placeholder.style.display = 'none';
+      stopBtn.disabled = false;
+      statusEl.textContent = 'KAMERA AKTIF';
+      resizeCanvas();
+      cancelAnimationFrame(rafId);
+      animate();
+      cameraLoop();
+    } catch (err) {
+      console.error(err);
+      startBtn.disabled = false;
+      statusEl.textContent = 'GAGAL MEMULAI';
+      let message = err && err.name === 'NotAllowedError'
+        ? 'Izin kamera ditolak. Buka pengaturan situs/browser dan izinkan kamera.'
+        : err && err.name === 'NotFoundError'
+          ? 'Kamera tidak ditemukan di perangkat ini.'
+          : 'Tidak bisa membuka kamera. Pastikan halaman dibuka lewat HTTPS atau localhost, dan izinkan akses kamera.';
+      hint.textContent = message;
+      hint.classList.add('error');
+    }
+  }
+
+  function stop() {
+    running = false;
+    cancelAnimationFrame(rafId);
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    stream = null;
+    video.pause();
+    video.srcObject = null;
+    lastLandmarks = null;
+    busy = false;
+    trails.clear();
+    const rect = stage.getBoundingClientRect();
+    ctx.clearRect(0, 0, rect.width, rect.height);
+    placeholder.style.display = 'flex';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    statusEl.textContent = 'KAMERA BELUM AKTIF';
+    meterFill.style.width = '0%';
+    hint.classList.remove('error');
+    hint.textContent = 'Kamera berhenti. Tekan “Mulai Kamera” untuk mencoba lagi.';
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+  window.addEventListener('pagehide', stop);
+})();
+</script>
+</body>
+</html>
